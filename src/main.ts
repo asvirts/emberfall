@@ -1,7 +1,7 @@
 import './style.css';
-import { TILE, MAPS, tileAt, isBlocked, MOVES } from './game/data';
-import { initialState, makeMember, saveGame, loadGame, type GameState } from './game/state';
-import { drawWindow, drawEnemy, drawHero, drawWorld, VW, VH } from './game/render';
+import { TILE, MAPS, tileAt, isBlocked, MOVES, HEROES } from './game/data';
+import { initialState, makeMember, saveGame, loadGame, xpNeedFor, type GameState } from './game/state';
+import { drawWindow, drawEnemy, drawHero, drawWorld, drawBattleBackdrop, drawTitleBackdrop, computeView, VW, VH } from './game/render';
 import { Battle, type PlannedCmd } from './game/battle';
 import { sfx } from './game/audio';
 
@@ -9,11 +9,36 @@ import { sfx } from './game/audio';
 document.querySelector('#app')!.innerHTML = `
   <div id="wrap"><canvas id="cv" width="${VW}" height="${VH}"></canvas>
   <button id="fs-btn" title="Toggle fullscreen (F)">&#x26F6; Fullscreen</button>
-  <div id="hint"><b>Arrows/WASD</b> move &nbsp; <b>Enter/Z</b> talk/confirm &nbsp; <b>X</b> back &nbsp; <b>K</b> save &nbsp; <b>F</b> fullscreen<br>
+  <div id="hint"><b>Arrows/WASD</b> move &nbsp; <b>Enter/Z</b> talk/confirm &nbsp; <b>X</b> back &nbsp; <b>Q/Tab</b> status &nbsp; <b>K</b> save &nbsp; <b>F</b> fullscreen<br>
   Find <b>Mira</b> in town, <b>Bram</b> in the east dungeon, beat the <b>Golem King</b>.</div></div>`;
 const cv = document.querySelector<HTMLCanvasElement>('#cv')!;
 const ctx = cv.getContext('2d')!;
 ctx.imageSmoothingEnabled = false;
+
+// Adaptive viewport + DPR-aware backing store.
+// computeView() expands the logical view to match the window aspect, so the
+// canvas fills the screen instead of letterboxing a 4:3 box. The context is
+// scaled so text rasterizes at full display resolution.
+let viewScale = 1;
+let viewDpr = 1;
+let fitW = 0, fitH = 0, fitDpr = 0;
+function fit(): void {
+  computeView(window.innerWidth, window.innerHeight);
+  const scale = Math.min(window.innerWidth / VW, window.innerHeight / VH);
+  // Cap DPR to bound backing-store size on 3x displays.
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  viewScale = scale;
+  viewDpr = dpr;
+  fitW = window.innerWidth; fitH = window.innerHeight; fitDpr = dpr;
+  cv.width = Math.max(2, Math.round(VW * scale * dpr));
+  cv.height = Math.max(2, Math.round(VH * scale * dpr));
+  cv.style.width = `${Math.max(2, Math.round(VW * scale))}px`;
+  cv.style.height = `${Math.max(2, Math.round(VH * scale))}px`;
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', fit);
+document.addEventListener('fullscreenchange', fit);
+fit();
 
 function toggleFullscreen(): void {
   if (!document.fullscreenElement) {
@@ -25,7 +50,7 @@ function toggleFullscreen(): void {
 document.querySelector('#fs-btn')!.addEventListener('click', toggleFullscreen);
 
 let S: GameState = initialState();
-type Mode = 'title' | 'overworld' | 'dialog' | 'battle';
+type Mode = 'title' | 'overworld' | 'dialog' | 'battle' | 'status';
 let mode: Mode = 'title';
 let hasSave = loadGame() !== null;
 
@@ -34,6 +59,8 @@ const held = new Set<string>();
 const pressed: string[] = [];
 function norm(e: KeyboardEvent): string {
   const k = e.key.toLowerCase();
+  if (k === 'tab') return 'statuskey';
+  if (k === 'q' || k === 'e') return 'statuskey';
   if (k === 'arrowup' || k === 'w') return 'up';
   if (k === 'arrowdown' || k === 's') return 'down';
   if (k === 'arrowleft' || k === 'a') return 'left';
@@ -45,7 +72,7 @@ function norm(e: KeyboardEvent): string {
   return k;
 }
 window.addEventListener('keydown', (e) => {
-  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Tab'].includes(e.key)) e.preventDefault();
   const n = norm(e);
   if (n === 'f') { toggleFullscreen(); return; }
   if (!held.has(n)) pressed.push(n);
@@ -79,11 +106,12 @@ let bAnimIdx = 0;
 let bAnimT = 0;
 let bEndLines: string[] = [];
 let bEndIdx = 0;
+let bLeveledUp = false;
 
 function startBattle(foeIds: string[], isBoss: boolean): void {
   B = new Battle(S.party, foeIds, isBoss, S.gold, S.potions, S.ethers);
   bPhase = 'intro'; bCmdIdx = 0; bMenu = 0; bSub = -1; bMagicCur = 0; bItemCur = 0;
-  bTargetFoe = 0; bTargetAlly = 0; bSelecting = 'none';
+  bTargetFoe = 0; bTargetAlly = 0; bSelecting = 'none'; bLeveledUp = false;
   bPlans = new Map(); bAnimLines = []; bAnimIdx = 0; bEndLines = []; bEndIdx = 0;
   mode = 'battle';
 }
@@ -236,9 +264,17 @@ function updateOverworld(dt: number, presses: string[]): void {
   for (const p of presses) {
     if (p === 'ok') interact();
     else if (p === 'savekey') { saveGame(S); sfx.confirm(); say(['Game saved.']); }
+    else if (p === 'statuskey') { sfx.confirm(); mode = 'status'; }
     else if (p === 'up' || p === 'down' || p === 'left' || p === 'right') {
       S.dir = p as typeof S.dir;
     }
+  }
+}
+
+function updateStatus(presses: string[]): void {
+  if (presses.includes('cancel') || presses.includes('statuskey') || presses.includes('ok')) {
+    sfx.cursor();
+    mode = 'overworld';
   }
 }
 
@@ -375,7 +411,9 @@ function enterBattleEnd(over: { victory?: boolean; fled?: boolean; wiped?: boole
   } else {
     const { xp, goldWon, levelLogs } = B!.settleVictory();
     S.gold += goldWon;
-    bEndLines = [`Victory! +${xp} XP, +${goldWon}G.`, ...levelLogs];
+    bEndLines = [`Victory! +${xp} EXP, +${goldWon}G.`, ...levelLogs];
+    bLeveledUp = levelLogs.length > 0;
+    if (bLeveledUp) setTimeout(() => sfx.heal(), 450);
     if (B!.isBoss) {
       S.flags.bossDone = true;
       bEndLines.push('The Golem King crumbles. EMBERFALL IS SAVED!');
@@ -401,38 +439,111 @@ function exitBattle(): void {
 
 // ---------- draw ----------
 function drawText(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color = '#fff'): void {
-  ctx.fillStyle = color;
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
   ctx.font = '8px monospace';
   ctx.textBaseline = 'top';
+  ctx.fillText(text, x + 1, y + 1);
+  ctx.fillStyle = color;
   ctx.fillText(text, x, y);
 }
 
-function drawTitle(): void {
-  ctx.fillStyle = '#0b0b14';
-  ctx.fillRect(0, 0, VW, VH);
-  drawText(ctx, 'EMBERFALL', 120, 70, '#ffd76a');
+// Wrap a single line to fit maxW pixels (measured, not char-counted).
+function wrapLine(text: string, maxW: number): string[] {
   ctx.font = '8px monospace';
-  drawText(ctx, 'an old-school turn RPG', 92, 84, '#9ca3af');
-  drawHero(ctx, VW / 2 - 8, 110, '#3b82f6', 'down', false, time);
-  drawWindow(ctx, 70, 160, 180, 52);
-  drawText(ctx, 'ENTER: new game', 82, 168);
-  drawText(ctx, hasSave ? 'C: continue save' : 'no save yet', 82, 180);
-  drawText(ctx, 'FF-style battles + random', 82, 192, '#ffd76a');
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let cur = '';
+  for (const w of words) {
+    const trial = cur ? cur + ' ' + w : w;
+    if (ctx.measureText(trial).width <= maxW || !cur) {
+      if (ctx.measureText(trial).width <= maxW) {
+        cur = trial;
+      } else {
+        // single word longer than the box: hard-split it
+        if (cur) { lines.push(cur); cur = ''; }
+        let part = '';
+        for (const ch of w) {
+          if (part && ctx.measureText(part + ch).width > maxW) { lines.push(part); part = ch; }
+          else part += ch;
+        }
+        cur = part;
+      }
+    } else {
+      lines.push(cur);
+      cur = w;
+      // w itself may still be too wide
+      while (ctx.measureText(cur).width > maxW && cur.length > 1) {
+        let k = cur.length - 1;
+        while (k > 1 && ctx.measureText(cur.slice(0, k)).width > maxW) k--;
+        lines.push(cur.slice(0, k));
+        cur = cur.slice(k);
+      }
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [''];
+}
+
+function wrapLines(texts: string[], maxW: number): string[] {
+  const out: string[] = [];
+  for (const t of texts) out.push(...wrapLine(t, maxW));
+  return out;
+}
+
+// Draw lines clipped to a window interior so text can never spill over borders.
+function drawClipped(x: number, y: number, w: number, h: number, fn: () => void): void {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + 4, y + 4, w - 8, h - 8);
+  ctx.clip();
+  fn();
+  ctx.restore();
+}
+
+function drawTitle(): void {
+  drawTitleBackdrop(ctx, time);
+  // FF6-style gold logo with shadow + gradient feel
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 28px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillText('EMBERFALL', VW / 2 + 2, 46 + 2);
+  const lg = ctx.createLinearGradient(0, 44, 0, 72);
+  lg.addColorStop(0, '#fff7cc');
+  lg.addColorStop(0.5, '#ffd76a');
+  lg.addColorStop(1, '#b45309');
+  ctx.fillStyle = lg;
+  ctx.fillText('EMBERFALL', VW / 2, 46);
+  ctx.font = '8px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillText('an old-school turn RPG', VW / 2 + 1, 77 + 1);
+  ctx.fillStyle = '#cdd3f0';
+  ctx.fillText('an old-school turn RPG', VW / 2, 77);
+  ctx.textAlign = 'left';
+  // hero lineup
+  drawHero(ctx, VW / 2 - 28, 96, '#3b82f6', 'down', false, time);
+  drawHero(ctx, VW / 2 - 8, 96, '#f59e0b', 'down', false, time + 300);
+  drawHero(ctx, VW / 2 + 12, 96, '#a855f7', 'down', false, time + 600);
+  const mw = 180, mx0 = Math.round(VW / 2 - mw / 2);
+  drawWindow(ctx, mx0, 152, mw, 60);
+  drawText(ctx, 'ENTER: new game', mx0 + 12, 160);
+  drawText(ctx, hasSave ? 'C: continue save' : 'no save yet', mx0 + 12, 172, hasSave ? '#fff' : '#8a8aa3');
+  drawText(ctx, 'FF6-style battles + wilds', mx0 + 12, 184, '#ffd76a');
+  if (Math.floor(time / 500) % 2 === 0) drawText(ctx, 'v press enter v', mx0 + 42, 196, '#fff');
 }
 
 function drawDialog(): void {
   drawOverworldScene();
-  drawWindow(ctx, 12, VH - 64, VW - 24, 56);
+  const dx = 12, dy = VH - 64, dw = VW - 24, dh = 56;
+  drawWindow(ctx, dx, dy, dw, dh);
   const line = dlgLines[dlgIdx] ?? '';
-  // wrap crudely
-  const words = line.split(' ');
-  let row = '';
-  let y = VH - 56;
-  for (const w of words) {
-    if ((row + ' ' + w).length > 42) { drawText(ctx, row, 20, y); y += 10; row = w; }
-    else row = row ? row + ' ' + w : w;
-  }
-  drawText(ctx, row, 20, y);
+  const maxW = dw - 16;
+  const wrapped = wrapLine(line, maxW);
+  // show last lines that fit (line height 10, top pad 8, bottom pad 8)
+  const maxLines = Math.floor((dh - 16) / 10);
+  const vis = wrapped.slice(-maxLines);
+  drawClipped(dx, dy, dw, dh, () => {
+    vis.forEach((row, i) => drawText(ctx, row, dx + 8, dy + 8 + i * 10));
+  });
   if (Math.floor(time / 400) % 2 === 0) drawText(ctx, '[ENTER]', VW - 58, VH - 18, '#ffd76a');
 }
 
@@ -441,87 +552,170 @@ function drawOverworldScene(): void {
   ctx.fillRect(0, 0, VW, VH);
   drawWorld(ctx, S, time, MAPS[S.mapId].rows);
   // HUD
-  drawWindow(ctx, 4, 4, 132, 30);
+  drawWindow(ctx, 4, 4, 148, 30);
   const names: Record<string, string> = { town: 'Ember Town', field: 'Greenfield', dungeon: 'Stone Deep' };
   drawText(ctx, names[S.mapId], 10, 8, '#ffd76a');
-  drawText(ctx, `G:${S.gold} Ptn:${S.potions}`, 10, 19);
-  // party mini
+  drawText(ctx, `G:${S.gold} Ptn:${S.potions} Q:status`, 10, 19);
+  // party mini — FF-style LV + HP + EXP bar on its own panel
+  const pw = 114, px0 = VW - pw - 4;
+  drawWindow(ctx, px0, 4, pw, S.party.length * 12 + 10);
   S.party.forEach((m, i) => {
-    drawText(ctx, `${m.name} ${m.hp}/${m.maxHp}`, VW - 92, 6 + i * 10, m.hp === 0 ? '#666' : '#fff');
+    const y = 6 + i * 12;
+    drawText(ctx, `${m.name} Lv${m.level}`, px0 + 6, y - 2, m.hp === 0 ? '#666' : '#fff');
+    drawText(ctx, `${m.hp}/${m.maxHp}`, px0 + 68, y - 2, m.hp === 0 ? '#f87171' : '#9ca3af');
+    const need = xpNeedFor(m);
+    const frac = Math.max(0, Math.min(1, m.xp / need));
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(px0 + 6, y + 7, 62, 3);
+    ctx.fillStyle = '#3a3a55'; ctx.fillRect(px0 + 7, y + 7, 60, 2);
+    ctx.fillStyle = '#ffd76a'; ctx.fillRect(px0 + 7, y + 7, 60 * frac, 2);
   });
   if (S.flags.bossDone) drawText(ctx, '* SAVED *', 10, VH - 14, '#4ade80');
 }
 
+function drawStatusScreen(): void {
+  drawOverworldScene();
+  // dim
+  ctx.fillStyle = 'rgba(0,0,10,0.6)';
+  ctx.fillRect(0, 0, VW, VH);
+  const wx = 20, wy = 18, ww = VW - 40, wh = VH - 36;
+  drawWindow(ctx, wx, wy, ww, wh);
+  drawText(ctx, 'PARTY STATUS  (X/Q: close)', wx + 10, wy + 7, '#ffd76a');
+  S.party.forEach((m, i) => {
+    const y = wy + 20 + i * 50;
+    if (y + 44 > wy + wh) return;
+    const job = HEROES[m.id]?.job ?? '';
+    drawHero(ctx, wx + 12, y, m.color, 'down', false, time + i * 300);
+    drawText(ctx, `${m.name}  Lv${m.level} ${job}`, wx + 32, y, '#fff');
+    const need = xpNeedFor(m);
+    drawText(ctx, `EXP ${m.xp}/${need}  NEXT ${need - m.xp}`, wx + 32, y + 10, '#9ca3af');
+    // exp bar (gold, FF-style)
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(wx + 32, y + 19, 120, 5);
+    ctx.fillStyle = '#3a3a55'; ctx.fillRect(wx + 33, y + 20, 118, 3);
+    ctx.fillStyle = '#ffd76a'; ctx.fillRect(wx + 33, y + 20, 118 * Math.max(0, Math.min(1, m.xp / need)), 3);
+    // hp/mp bars
+    drawText(ctx, `HP ${m.hp}/${m.maxHp}`, wx + 32, y + 27, m.hp === 0 ? '#f87171' : '#fff');
+    ctx.fillStyle = '#3a0d0d'; ctx.fillRect(wx + 90, y + 28, 60, 3);
+    ctx.fillStyle = '#4ade80'; ctx.fillRect(wx + 90, y + 28, 60 * (m.hp / m.maxHp), 3);
+    drawText(ctx, `MP ${m.mp}/${m.maxMp}`, wx + 160, y + 27, '#fff');
+    ctx.fillStyle = '#0d1a3a'; ctx.fillRect(wx + 208, y + 28, 44, 3);
+    ctx.fillStyle = '#60a5fa'; ctx.fillRect(wx + 208, y + 28, 44 * (m.mp / m.maxMp), 3);
+    drawText(ctx, `ATK${m.atk} DEF${m.def} SPD${m.spd}  ${m.magic.join('/')}`, wx + 32, y + 37, '#cbd5e1');
+  });
+  drawText(ctx, `Gold ${S.gold}G  Potions ${S.potions}  Ethers ${S.ethers}`, wx + 10, wy + wh - 14, '#cbd5e1');
+}
+
 function drawBattleScene(): void {
   if (!B) return;
-  // bg
-  const g = ctx.createLinearGradient(0, 0, 0, VH);
-  g.addColorStop(0, B.isBoss ? '#3f1d24' : '#14261a');
-  g.addColorStop(1, '#0b0b14');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, VW, VH);
-  ctx.fillStyle = 'rgba(255,255,255,0.06)';
-  for (let i = 0; i < 5; i++) ctx.fillRect(0, 30 + i * 12, VW, 1);
+  // FF6 terrain-aware backdrop
+  drawBattleBackdrop(ctx, S.mapId, B.isBoss, time);
   // foes
   B.foes.forEach((f, i) => {
     const alive = f.hp > 0;
     const n = B!.foes.length;
-    const bx = VW / 2 + (i - (n - 1) / 2) * 56 - 8;
-    const by = 56 + (i % 2) * 8;
+    const bx = VW / 2 + 20 + (i - (n - 1) / 2) * 52 - 8;
+    const by = 92 + (i % 2) * 10 + (f.big || f.id === 'boss' ? -14 : 0);
+    const bobY = by + Math.sin(time / 350 + i * 1.7) * 1.5;
     if (!alive) { ctx.fillStyle = 'rgba(255,255,255,0.25)'; }
     const selecting = bPhase === 'cmd' && bSelecting === 'foe' && bTargetFoe === i;
-    drawEnemy(ctx, f.id, bx, by, alive ? f.color : '#444', time, f.big);
-    drawText(ctx, f.name, bx - 8, by - 10, selecting ? '#ffd76a' : '#fff');
-    // hp bar
-    ctx.fillStyle = '#333'; ctx.fillRect(bx - 4, by + 18, 24, 3);
-    ctx.fillStyle = '#4ade80'; ctx.fillRect(bx - 4, by + 18, 24 * (f.hp / f.maxHp), 3);
-    if (selecting && Math.floor(time / 250) % 2 === 0) drawText(ctx, 'v', bx + 4, by - 20, '#ffd76a');
+    // target flash ring
+    if (selecting && Math.floor(time / 250) % 2 === 0) {
+      ctx.fillStyle = 'rgba(255,215,106,0.35)';
+      ctx.fillRect(bx - 4, bobY - 4, 26, 26);
+    }
+    drawEnemy(ctx, f.id, bx, bobY, alive ? f.color : '#444', time, f.big);
+    ctx.font = '8px monospace';
+    const nw = ctx.measureText(f.name).width;
+    const nx = Math.max(2, Math.min(VW - 2 - nw, bx + 8 - nw / 2));
+    drawText(ctx, f.name, nx, bobY - 11, selecting ? '#ffd76a' : '#fff');
+    // hp bar (FF6 framed)
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(bx - 5, bobY + 17, 26, 5);
+    ctx.fillStyle = '#3a0d0d'; ctx.fillRect(bx - 4, bobY + 18, 24, 3);
+    ctx.fillStyle = f.hp / f.maxHp > 0.3 ? '#4ade80' : '#ef4444';
+    ctx.fillRect(bx - 4, bobY + 18, 24 * (f.hp / f.maxHp), 3);
+    if (selecting && Math.floor(time / 250) % 2 === 0) drawText(ctx, 'v', bx + 4, bobY - 21, '#ffd76a');
   });
   // party lineup left
   S.party.forEach((m, i) => {
-    const py = 120 + i * 18;
+    const py = 112 + i * 18;
     const active = bPhase === 'cmd' && bCmdIdx === i;
+    if (active && Math.floor(time / 300) % 2 === 0) {
+      ctx.fillStyle = 'rgba(255,215,106,0.22)';
+      ctx.fillRect(12, py - 2, 22, 20);
+    }
     drawHero(ctx, 18, py, m.hp > 0 ? m.color : '#444', 'right', active, time + i * 200);
-    drawText(ctx, `${m.name} L${m.level}`, 38, py + 1, active ? '#ffd76a' : '#fff');
-    drawText(ctx, `HP${m.hp}/${m.maxHp} MP${m.mp}/${m.maxMp}`, 38, py + 10, m.hp === 0 ? '#f87171' : '#9ca3af');
+    drawText(ctx, `${m.name} Lv${m.level}`, 38, py - 4, active ? '#ffd76a' : '#fff');
+    drawText(ctx, `HP${m.hp}/${m.maxHp} MP${m.mp}/${m.maxMp}`, 38, py + 5, m.hp === 0 ? '#f87171' : '#9ca3af');
+    // FF-style EXP bar under each battler
+    const need = xpNeedFor(m);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(38, py + 14, 52, 3);
+    ctx.fillStyle = '#3a3a55'; ctx.fillRect(39, py + 14, 50, 2);
+    ctx.fillStyle = '#ffd76a'; ctx.fillRect(39, py + 14, 50 * Math.max(0, Math.min(1, m.xp / need)), 2);
     if (bPhase === 'cmd' && bSelecting === 'ally' && bTargetAlly === i && Math.floor(time / 250) % 2 === 0) {
       drawText(ctx, '>', 8, py + 4, '#ffd76a');
     }
   });
   // message / menu windows
   if (bPhase === 'intro') {
-    drawWindow(ctx, 12, VH - 64, VW - 24, 56);
-    drawText(ctx, B.log[0] ?? '', 20, VH - 52);
+    const ix = 12, iy = VH - 64, iw = VW - 24, ih = 56;
+    drawWindow(ctx, ix, iy, iw, ih);
+    const wrapped = wrapLine(B.log[0] ?? '', iw - 16);
+    const vis = wrapped.slice(0, Math.floor((ih - 16) / 10));
+    drawClipped(ix, iy, iw, ih, () => {
+      vis.forEach((l, i) => drawText(ctx, l, ix + 8, iy + 8 + i * 10));
+    });
     drawText(ctx, '[ENTER]', VW - 58, VH - 20, '#ffd76a');
   } else if (bPhase === 'cmd') {
-    drawWindow(ctx, 12, VH - 64, 180, 56);
+    const menuX = 12, menuY = VH - 68, menuW = 112, menuH = 60;
+    const logX = menuX + menuW + 6, logY = VH - 68, logW = VW - logX - 12, logH = 60;
+    drawWindow(ctx, menuX, menuY, menuW, menuH);
     const m = S.party[bCmdIdx];
-    drawText(ctx, `${m.name}: choose`, 20, VH - 56, '#ffd76a');
-    if (bSub === -1) {
-      const opts = ['Fight', 'Magic', 'Item', 'Run'];
-      opts.forEach((o, i) => drawText(ctx, `${bMenu === i ? '>' : ' '} ${o}`, 24, VH - 44 + i * 10, bMenu === i ? '#fff' : '#9ca3af'));
-    } else if (bSub === 0) {
-      m.magic.forEach((id, i) => {
-        const mv = MOVES[id];
-        drawText(ctx, `${bMagicCur === i ? '>' : ' '} ${mv.name} ${mv.mp}mp`, 24, VH - 44 + i * 10, m.mp >= mv.mp ? '#fff' : '#666');
-      });
-      drawText(ctx, 'X: back', 120, VH - 20, '#9ca3af');
-    } else if (bSub === 1) {
-      drawText(ctx, `${bItemCur === 0 ? '>' : ' '} Potion x${S.potions}`, 24, VH - 44);
-      drawText(ctx, `${bItemCur === 1 ? '>' : ' '} Ether x${S.ethers}`, 24, VH - 34);
-      drawText(ctx, 'X: back', 120, VH - 20, '#9ca3af');
-    }
-    drawWindow(ctx, 198, VH - 64, VW - 210, 56);
-    const last = B.log.slice(-3);
-    last.forEach((l, i) => drawText(ctx, l.slice(0, 30), 206, VH - 56 + i * 10, '#cbd5e1'));
+    drawClipped(menuX, menuY, menuW, menuH, () => {
+      if (bSub === -1) {
+        drawText(ctx, `${m.name}: choose`, menuX + 8, menuY + 6, '#ffd76a');
+        const opts = ['Fight', 'Magic', 'Item', 'Run'];
+        opts.forEach((o, i) => drawText(ctx, `${bMenu === i ? '>' : ' '} ${o}`, menuX + 12, menuY + 16 + i * 9, bMenu === i ? '#fff' : '#9ca3af'));
+      } else if (bSub === 0) {
+        m.magic.forEach((id, i) => {
+          const mv = MOVES[id];
+          drawText(ctx, `${bMagicCur === i ? '>' : ' '} ${mv.name} ${mv.mp}mp`, menuX + 8, menuY + 6 + i * 9, m.mp >= mv.mp ? '#fff' : '#666');
+        });
+        drawText(ctx, 'X: back', menuX + 8, menuY + menuH - 14, '#9ca3af');
+      } else if (bSub === 1) {
+        drawText(ctx, `${bItemCur === 0 ? '>' : ' '} Potion x${S.potions}`, menuX + 8, menuY + 6);
+        drawText(ctx, `${bItemCur === 1 ? '>' : ' '} Ether x${S.ethers}`, menuX + 8, menuY + 15);
+        drawText(ctx, 'X: back', menuX + 8, menuY + menuH - 14, '#9ca3af');
+      }
+    });
+    drawWindow(ctx, logX, logY, logW, logH);
+    const maxLogW = logW - 16;
+    const maxLogLines = Math.floor((logH - 12) / 10);
+    const wrappedLog = wrapLines(B.log.slice(-3), maxLogW).slice(-maxLogLines);
+    drawClipped(logX, logY, logW, logH, () => {
+      wrappedLog.forEach((l, i) => drawText(ctx, l, logX + 8, logY + 6 + i * 10, '#cbd5e1'));
+    });
   } else if (bPhase === 'anim') {
-    drawWindow(ctx, 12, VH - 64, VW - 24, 56);
-    const upto = bAnimLines.slice(Math.max(0, bAnimIdx - 2), bAnimIdx + 1);
-    upto.forEach((l, i) => drawText(ctx, l.slice(0, 44), 20, VH - 56 + i * 10));
+    const ax = 12, ay = VH - 64, aw = VW - 24, ah = 56;
+    drawWindow(ctx, ax, ay, aw, ah);
+    const wrapped = wrapLines(bAnimLines.slice(Math.max(0, bAnimIdx - 1), bAnimIdx + 1), aw - 16);
+    const vis = wrapped.slice(-4);
+    drawClipped(ax, ay, aw, ah, () => {
+      vis.forEach((l, i) => drawText(ctx, l, ax + 8, ay + 8 + i * 10));
+    });
   } else if (bPhase === 'end') {
-    drawWindow(ctx, 12, VH - 64, VW - 24, 56);
-    const upto = bEndLines.slice(0, bEndIdx + 1);
-    upto.forEach((l, i) => drawText(ctx, l.slice(0, 44), 20, VH - 56 + i * 10));
+    const ex = 12, ey = VH - 64, ew = VW - 24, eh = 56;
+    // level-up flash banner, old-FF fanfare feel
+    if (bLeveledUp && Math.floor(time / 300) % 2 === 0) {
+      ctx.fillStyle = 'rgba(255,215,106,0.25)';
+      ctx.fillRect(ex, ey - 16, ew, 14);
+      drawText(ctx, '** LEVEL UP! **', ex + 92, ey - 13, '#ffd76a');
+    }
+    drawWindow(ctx, ex, ey, ew, eh);
+    // sliding window so long victory text never spills out
+    const wrapped = wrapLines(bEndLines.slice(0, bEndIdx + 1), ew - 16);
+    const vis = wrapped.slice(-3);
+    drawClipped(ex, ey, ew, eh, () => {
+      vis.forEach((l, i) => drawText(ctx, l, ex + 8, ey + 8 + i * 10));
+    });
     drawText(ctx, '[ENTER]', VW - 58, VH - 20, '#ffd76a');
   }
 }
@@ -530,6 +724,11 @@ function drawBattleScene(): void {
 function frame(now: number): void {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now; time += dt * 1000;
+  // Re-fit if window/DPR changed (resize, zoom, monitor move, fullscreen).
+  const curDpr = Math.min(3, window.devicePixelRatio || 1);
+  if (window.innerWidth !== fitW || window.innerHeight !== fitH || curDpr !== fitDpr) fit();
+  // Draw in game units; backing store gives full-resolution text.
+  ctx.setTransform(viewScale * viewDpr, 0, 0, viewScale * viewDpr, 0, 0);
   const presses = takePress();
   if (mode === 'title') {
     if (presses.includes('ok')) { S = initialState(); mode = 'overworld'; saveGame(S); hasSave = true; sfx.confirm(); }
@@ -539,7 +738,12 @@ function frame(now: number): void {
     updateOverworld(dt, presses);
     if (mode === 'overworld') drawOverworldScene();
     else if (mode === 'dialog') drawDialog();
+    else if (mode === 'status') drawStatusScreen();
     else if (mode === 'battle') drawBattleScene();
+  } else if (mode === 'status') {
+    (S as unknown as { __moving: boolean }).__moving = false;
+    updateStatus(presses);
+    if (mode === 'status') drawStatusScreen(); else drawOverworldScene();
   } else if (mode === 'dialog') {
     (S as unknown as { __moving: boolean }).__moving = false;
     updateDialog(presses);

@@ -1,4 +1,4 @@
-import { HEROES, xpForLevel } from './data';
+import { HEROES, LEARNS, xpForLevel } from './data';
 
 export interface PartyMember {
   id: string;
@@ -36,13 +36,40 @@ export interface GameState {
   stepsSinceBattle: number;
 }
 
+/** XP still needed for this member's next level (FF-style NEXT). */
+export function xpNeedFor(m: PartyMember): number {
+  const scale = HEROES[m.id]?.xpNeed ?? 1;
+  return xpForLevel(m.level, scale);
+}
+
+function applyLearns(m: PartyMember): string[] {
+  const logs: string[] = [];
+  const table = LEARNS[m.id] ?? [];
+  for (const l of table) {
+    if (m.level >= l.level && !m.magic.includes(l.magicId)) {
+      m.magic.push(l.magicId);
+      logs.push(`${m.name} learned ${l.magicId === 'bolt' ? 'Bolt' : l.magicId === 'fire' ? 'Fire' : 'Heal'}!`);
+    }
+  }
+  return logs;
+}
+
 export function makeMember(heroId: string, level = 1): PartyMember {
   const d = HEROES[heroId];
-  return {
-    id: d.id, name: d.name, level, xp: 0,
+  const m: PartyMember = {
+    id: d.id, name: d.name, level: 1, xp: 0,
     hp: d.maxHp, maxHp: d.maxHp, mp: d.maxMp, maxMp: d.maxMp,
     atk: d.atk, def: d.def, spd: d.spd, magic: [...d.magic], color: d.color,
   };
+  // FF-style: recruits join at party level with earned growth applied.
+  while (m.level < level) {
+    m.level += 1;
+    m.maxHp += d.growth.hp; m.maxMp += d.growth.mp;
+    m.atk += d.growth.atk; m.def += d.growth.def; m.spd += d.growth.spd;
+  }
+  m.hp = m.maxHp; m.mp = m.maxMp;
+  applyLearns(m);
+  return m;
 }
 
 export function initialState(): GameState {
@@ -59,14 +86,19 @@ export function initialState(): GameState {
 
 export function grantXp(m: PartyMember, amount: number): string[] {
   const logs: string[] = [];
+  const def = HEROES[m.id];
+  const g = def?.growth ?? { hp: 6, mp: 2, atk: 2, def: 1, spd: 1 };
+  const scale = def?.xpNeed ?? 1;
   m.xp += amount;
-  while (m.xp >= xpForLevel(m.level)) {
-    m.xp -= xpForLevel(m.level);
+  while (m.xp >= xpForLevel(m.level, scale)) {
+    m.xp -= xpForLevel(m.level, scale);
     m.level += 1;
-    m.maxHp += 6; m.maxMp += 2; m.atk += 2; m.def += 1; m.spd += 1;
+    m.maxHp += g.hp; m.maxMp += g.mp; m.atk += g.atk; m.def += g.def; m.spd += g.spd;
     m.hp = Math.min(m.maxHp, m.hp + Math.floor(m.maxHp / 2));
     m.mp = Math.min(m.maxMp, m.mp + 2);
     logs.push(`${m.name} grew to Lv${m.level}!`);
+    logs.push(` HP+${g.hp} MP+${g.mp} ATK+${g.atk} DEF+${g.def} SPD+${g.spd}`);
+    logs.push(...applyLearns(m));
   }
   return logs;
 }
@@ -83,6 +115,16 @@ export function loadGame(): GameState | null {
     if (!raw) return null;
     const p = JSON.parse(raw) as GameState;
     if (!p.party || !p.mapId) return null;
+    // migrate old saves missing xp / new fields
+    for (const m of p.party) {
+      if (typeof m.xp !== 'number') m.xp = 0;
+      if (!HEROES[m.id]) continue;
+      // backfill spells they would have learned by now
+      const table = LEARNS[m.id] ?? [];
+      for (const l of table) {
+        if (m.level >= l.level && !m.magic.includes(l.magicId)) m.magic.push(l.magicId);
+      }
+    }
     return p;
   } catch { return null; }
 }

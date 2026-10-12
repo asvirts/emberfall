@@ -20,6 +20,7 @@ export const MOVES: Record<string, MoveDef> = {
 export interface HeroDef {
   id: string;
   name: string;
+  job: string;
   maxHp: number;
   maxMp: number;
   atk: number;
@@ -27,12 +28,23 @@ export interface HeroDef {
   spd: number;
   magic: string[];
   color: string;
+  /** per-level gains (old-FF job growth) */
+  growth: { hp: number; mp: number; atk: number; def: number; spd: number };
+  /** XP curve multiplier: <1 fast, >1 slow */
+  xpNeed: number;
 }
 
 export const HEROES: Record<string, HeroDef> = {
-  hero: { id: 'hero', name: 'Ash', maxHp: 30, maxMp: 10, atk: 7, def: 4, spd: 5, magic: ['fire', 'heal'], color: '#3b82f6' },
-  mira: { id: 'mira', name: 'Mira', maxHp: 24, maxMp: 16, atk: 5, def: 3, spd: 8, magic: ['fire', 'bolt', 'heal'], color: '#f59e0b' },
-  bram: { id: 'bram', name: 'Bram', maxHp: 38, maxMp: 6, atk: 9, def: 6, spd: 3, magic: ['heal'], color: '#a855f7' },
+  hero: { id: 'hero', name: 'Ash', job: 'Knight', maxHp: 30, maxMp: 10, atk: 7, def: 4, spd: 5, magic: ['fire', 'heal'], color: '#3b82f6', growth: { hp: 7, mp: 2, atk: 2, def: 1, spd: 1 }, xpNeed: 1.0 },
+  mira: { id: 'mira', name: 'Mira', job: 'Mage', maxHp: 24, maxMp: 16, atk: 5, def: 3, spd: 8, magic: ['fire', 'heal'], color: '#f59e0b', growth: { hp: 5, mp: 4, atk: 1, def: 1, spd: 2 }, xpNeed: 0.9 },
+  bram: { id: 'bram', name: 'Bram', job: 'Warrior', maxHp: 38, maxMp: 6, atk: 9, def: 6, spd: 3, magic: ['heal'], color: '#a855f7', growth: { hp: 9, mp: 1, atk: 3, def: 2, spd: 1 }, xpNeed: 1.15 },
+};
+
+/** Spells learned by level, FF-style. Checked on recruit + level-up. */
+export const LEARNS: Record<string, Array<{ level: number; magicId: string }>> = {
+  hero: [{ level: 4, magicId: 'bolt' }],
+  mira: [{ level: 2, magicId: 'bolt' }],
+  bram: [{ level: 3, magicId: 'fire' }, { level: 6, magicId: 'bolt' }],
 };
 
 export interface EnemyDef {
@@ -57,8 +69,9 @@ export const ENEMIES: Record<string, EnemyDef> = {
   boss: { id: 'boss', name: 'Golem King', maxHp: 110, atk: 13, def: 5, spd: 4, xp: 140, gold: 120, color: '#ef4444', big: true },
 };
 
-export function xpForLevel(level: number): number {
-  return level * 22;
+export function xpForLevel(level: number, scale = 1): number {
+  // Old-FF style rising curve: cost grows each level, scaled per job.
+  return Math.floor((level * 24 + (level - 1) * (level - 1) * 6) * scale);
 }
 
 // ---- Hand-coded maps. Legend:

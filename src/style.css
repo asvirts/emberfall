@@ -28,10 +28,7 @@ body {
   background: #000;
 }
 canvas {
-  /* Fill the viewport while preserving the 4:3 (320x240) aspect ratio */
-  width: min(100vw, calc(100dvh * 4 / 3));
-  height: min(100dvh, calc(100vw * 3 / 4));
-  aspect-ratio: 4 / 3;
+  /* Size is set via JS integer scaling for crisp pixels (see fit() in main.ts) */
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   background: #000;
